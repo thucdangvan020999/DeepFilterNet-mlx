@@ -33,6 +33,8 @@ extension DeepFilterNetModel {
             let pointwiseWeightOHWI: MLXArray?
             let bnScale: MLXArray
             let bnBias: MLXArray
+            let bnScaleNHWC: MLXArray
+            let bnBiasNHWC: MLXArray
             let fstride: Int
         }
 
@@ -95,8 +97,11 @@ extension DeepFilterNetModel {
         var erbState: MLXArray
         var dfState: MLXArray
 
-        var rings: DeepFilterNetStreamingRings
-        var recurrentState = DeepFilterNetStreamRecurrentState()
+        let rings: DeepFilterNetStreamingRings
+        let recurrentState = DeepFilterNetStreamRecurrentState()
+        var encErbSeqState: MLXArray
+        var encDfSeqState: MLXArray
+        var dfConvpSeqState: MLXArray
 
         var delayDropped = 0
         var hopsSinceMaterialize = 0
@@ -234,6 +239,9 @@ extension DeepFilterNetModel {
                 encDf: TensorRingBuffer(capacity: 3, initial: zeroEncDfFrame),
                 dfConvp: TensorRingBuffer(capacity: max(1, dfConvpKernelSizeT), initial: zeroDfConvpFrame)
             )
+            self.encErbSeqState = Self.repeatedSequence(frame: self.zeroEncErbFrame, count: 3)
+            self.encDfSeqState = Self.repeatedSequence(frame: self.zeroEncDfFrame, count: 3)
+            self.dfConvpSeqState = Self.repeatedSequence(frame: self.zeroDfConvpFrame, count: self.dfConvpKernelSizeT)
             if model.performanceConfig.preferCompiledGraphs {
                 if let erbFB = self.erbFBFrame {
                     self.compiledAnalysisFeatureStep = Self.buildCompiledAnalysisFeatureStep(
@@ -512,49 +520,65 @@ extension DeepFilterNetModel {
             else {
                 return nil
             }
+            let conv3pScaleNHWC = conv3pBN.0.transposed(0, 2, 3, 1)
+            let conv3pBiasNHWC = conv3pBN.1.transposed(0, 2, 3, 1)
+            let convt3ScaleNHWC = convt3BN.0.transposed(0, 2, 3, 1)
+            let convt3BiasNHWC = convt3BN.1.transposed(0, 2, 3, 1)
+            let conv2pScaleNHWC = conv2pBN.0.transposed(0, 2, 3, 1)
+            let conv2pBiasNHWC = conv2pBN.1.transposed(0, 2, 3, 1)
+            let convt2ScaleNHWC = convt2BN.0.transposed(0, 2, 3, 1)
+            let convt2BiasNHWC = convt2BN.1.transposed(0, 2, 3, 1)
+            let conv1pScaleNHWC = conv1pBN.0.transposed(0, 2, 3, 1)
+            let conv1pBiasNHWC = conv1pBN.1.transposed(0, 2, 3, 1)
+            let convt1ScaleNHWC = convt1BN.0.transposed(0, 2, 3, 1)
+            let convt1BiasNHWC = convt1BN.1.transposed(0, 2, 3, 1)
+            let conv0pScaleNHWC = conv0pBN.0.transposed(0, 2, 3, 1)
+            let conv0pBiasNHWC = conv0pBN.1.transposed(0, 2, 3, 1)
+            let conv0OutScaleNHWC = conv0OutBN.0.transposed(0, 2, 3, 1)
+            let conv0OutBiasNHWC = conv0OutBN.1.transposed(0, 2, 3, 1)
 
             return compile(shapeless: false) { inputs in
-                let embDec = inputs[0]
-                let e3 = inputs[1]
-                let e2 = inputs[2]
-                let e1 = inputs[3]
-                let e0 = inputs[4]
+                let embDecNHWC = inputs[0]
+                let e3NHWC = inputs[1]
+                let e2NHWC = inputs[2]
+                let e1NHWC = inputs[3]
+                let e0NHWC = inputs[4]
 
                 let p3 = relu(
-                    DeepFilterNetModel.conv2dBCHW(e3, weightOHWI: conv3pW, bias: nil, fstride: 1, lookahead: 0)
-                        * conv3pBN.0 + conv3pBN.1
+                    DeepFilterNetModel.conv2dNHWC(e3NHWC, weightOHWI: conv3pW, bias: nil, fstride: 1, lookahead: 0)
+                        * conv3pScaleNHWC + conv3pBiasNHWC
                 )
-                var d3 = p3 + embDec
-                d3 = DeepFilterNetModel.conv2dBCHW(d3, weightOHWI: convt3W0, bias: nil, fstride: 1, lookahead: 0)
-                d3 = DeepFilterNetModel.conv2dBCHW(d3, weightOHWI: convt3W1, bias: nil, fstride: 1, lookahead: 0)
-                d3 = relu(d3 * convt3BN.0 + convt3BN.1)
+                var d3 = p3 + embDecNHWC
+                d3 = DeepFilterNetModel.conv2dNHWC(d3, weightOHWI: convt3W0, bias: nil, fstride: 1, lookahead: 0)
+                d3 = DeepFilterNetModel.conv2dNHWC(d3, weightOHWI: convt3W1, bias: nil, fstride: 1, lookahead: 0)
+                d3 = relu(d3 * convt3ScaleNHWC + convt3BiasNHWC)
 
                 let p2 = relu(
-                    DeepFilterNetModel.conv2dBCHW(e2, weightOHWI: conv2pW, bias: nil, fstride: 1, lookahead: 0)
-                        * conv2pBN.0 + conv2pBN.1
+                    DeepFilterNetModel.conv2dNHWC(e2NHWC, weightOHWI: conv2pW, bias: nil, fstride: 1, lookahead: 0)
+                        * conv2pScaleNHWC + conv2pBiasNHWC
                 )
                 var d2 = p2 + d3
-                d2 = DeepFilterNetModel.convTranspose2dBCHWDense(d2, denseWeight: convt2Dense, fstride: 2)
-                d2 = DeepFilterNetModel.conv2dBCHW(d2, weightOHWI: convt2W1, bias: nil, fstride: 1, lookahead: 0)
-                d2 = relu(d2 * convt2BN.0 + convt2BN.1)
+                d2 = DeepFilterNetModel.convTranspose2dNHWCDense(d2, denseWeight: convt2Dense, fstride: 2)
+                d2 = DeepFilterNetModel.conv2dNHWC(d2, weightOHWI: convt2W1, bias: nil, fstride: 1, lookahead: 0)
+                d2 = relu(d2 * convt2ScaleNHWC + convt2BiasNHWC)
 
                 let p1 = relu(
-                    DeepFilterNetModel.conv2dBCHW(e1, weightOHWI: conv1pW, bias: nil, fstride: 1, lookahead: 0)
-                        * conv1pBN.0 + conv1pBN.1
+                    DeepFilterNetModel.conv2dNHWC(e1NHWC, weightOHWI: conv1pW, bias: nil, fstride: 1, lookahead: 0)
+                        * conv1pScaleNHWC + conv1pBiasNHWC
                 )
                 var d1 = p1 + d2
-                d1 = DeepFilterNetModel.convTranspose2dBCHWDense(d1, denseWeight: convt1Dense, fstride: 2)
-                d1 = DeepFilterNetModel.conv2dBCHW(d1, weightOHWI: convt1W1, bias: nil, fstride: 1, lookahead: 0)
-                d1 = relu(d1 * convt1BN.0 + convt1BN.1)
+                d1 = DeepFilterNetModel.convTranspose2dNHWCDense(d1, denseWeight: convt1Dense, fstride: 2)
+                d1 = DeepFilterNetModel.conv2dNHWC(d1, weightOHWI: convt1W1, bias: nil, fstride: 1, lookahead: 0)
+                d1 = relu(d1 * convt1ScaleNHWC + convt1BiasNHWC)
 
                 let p0 = relu(
-                    DeepFilterNetModel.conv2dBCHW(e0, weightOHWI: conv0pW, bias: nil, fstride: 1, lookahead: 0)
-                        * conv0pBN.0 + conv0pBN.1
+                    DeepFilterNetModel.conv2dNHWC(e0NHWC, weightOHWI: conv0pW, bias: nil, fstride: 1, lookahead: 0)
+                        * conv0pScaleNHWC + conv0pBiasNHWC
                 )
                 let d0 = p0 + d1
-                var out = DeepFilterNetModel.conv2dBCHW(d0, weightOHWI: conv0OutW, bias: nil, fstride: 1, lookahead: 0)
-                out = out * conv0OutBN.0 + conv0OutBN.1
-                return [sigmoid(out)]
+                var out = DeepFilterNetModel.conv2dNHWC(d0, weightOHWI: conv0OutW, bias: nil, fstride: 1, lookahead: 0)
+                out = out * conv0OutScaleNHWC + conv0OutBiasNHWC
+                return [sigmoid(out.transposed(0, 3, 1, 2))]
             }
         }
 
@@ -567,15 +591,16 @@ extension DeepFilterNetModel {
             else {
                 return nil
             }
+            let bnScaleNHWC = bn.0.transposed(0, 2, 3, 1)
+            let bnBiasNHWC = bn.1.transposed(0, 2, 3, 1)
 
             return compile(shapeless: false) { inputs in
-                let c0Seq = inputs[0]
-                var c0p = DeepFilterNetModel.conv2dBCHW(c0Seq, weightOHWI: conv1, bias: nil, fstride: 1, lookahead: 0)
-                c0p = DeepFilterNetModel.conv2dBCHW(c0p, weightOHWI: conv2, bias: nil, fstride: 1, lookahead: 0)
-                c0p = relu(c0p * bn.0 + bn.1)
-                let t = c0p.shape[2]
-                c0p = c0p[0..., 0..., (t - 1)..<t, 0...]
-                return [c0p.transposed(0, 2, 3, 1)]
+                let c0SeqNHWC = inputs[0].transposed(0, 2, 3, 1)
+                var c0p = DeepFilterNetModel.conv2dNHWC(c0SeqNHWC, weightOHWI: conv1, bias: nil, fstride: 1, lookahead: 0)
+                c0p = DeepFilterNetModel.conv2dNHWC(c0p, weightOHWI: conv2, bias: nil, fstride: 1, lookahead: 0)
+                c0p = relu(c0p * bnScaleNHWC + bnBiasNHWC)
+                let t = c0p.shape[1]
+                return [c0p[0..., (t - 1)..<t, 0..., 0...]]
             }
         }
 
@@ -686,6 +711,8 @@ extension DeepFilterNetModel {
                 pointwiseWeightOHWI: pointwiseWeight,
                 bnScale: bnScale,
                 bnBias: bnBias,
+                bnScaleNHWC: bnScale.transposed(0, 2, 3, 1),
+                bnBiasNHWC: bnBias.transposed(0, 2, 3, 1),
                 fstride: fstride
             )
         }
@@ -698,6 +725,9 @@ extension DeepFilterNetModel {
             dfState = MLXArray(Self.linspace(start: 0.001, end: 0.0001, count: nbDf))
             rings.reset()
             recurrentState.reset()
+            encErbSeqState = Self.repeatedSequence(frame: zeroEncErbFrame, count: 3)
+            encDfSeqState = Self.repeatedSequence(frame: zeroEncDfFrame, count: 3)
+            dfConvpSeqState = Self.repeatedSequence(frame: zeroDfConvpFrame, count: dfConvpKernelSizeT)
             delayDropped = 0
             hopsSinceMaterialize = 0
             profHopCount = 0
@@ -884,10 +914,16 @@ extension DeepFilterNetModel {
                 // Combined path; attribute to analysis bucket for continuity.
                 profAnalysisSeconds += dt
             }
+            let specLowFrameRaw = spec[0..<nbDf, 0...]
+            let specLowFrame = specLowFrameRaw.dtype == inferenceDType
+                ? specLowFrameRaw
+                : specLowFrameRaw.asType(inferenceDType)
+            let featErbFrame = featErb.dtype == inferenceDType ? featErb : featErb.asType(inferenceDType)
+            let featDfFrame = featDf.dtype == inferenceDType ? featDf : featDf.asType(inferenceDType)
             rings.spec.push(spec)
-            rings.specLow.push(spec[0..<nbDf, 0...].asType(inferenceDType))
-            rings.encErb.push(featErb.asType(inferenceDType))
-            rings.encDf.push(featDf.asType(inferenceDType))
+            rings.specLow.push(specLowFrame)
+            encErbSeqState = Self.appendTimeFrame(encErbSeqState, frame: featErbFrame)
+            encDfSeqState = Self.appendTimeFrame(encDfSeqState, frame: featDfFrame)
 
             if rings.spec.totalWritten <= convLookahead {
                 return nil
@@ -1063,30 +1099,49 @@ extension DeepFilterNetModel {
                 .expandedDimensions(axis: 0)
                 .asType(inferenceDType)
 
-            let encErbSeq = historyTensor(
-                from: rings.encErb,
-                requiredCount: 3,
-                zeroFrame: zeroEncErbFrame
-            )
-            let encDfSeq = historyTensor(
-                from: rings.encDf,
-                requiredCount: 3,
-                zeroFrame: zeroEncDfFrame
-            )
+            let useCompiledNHWCEncode = compiledStreamErbDecoderStep != nil
+            let e0: MLXArray
+            let e1: MLXArray
+            let e2: MLXArray
+            let e3: MLXArray
+            let c0: MLXArray
+            let c1: MLXArray
+            var emb: MLXArray
+            if useCompiledNHWCEncode {
+                let encErbSeqNHWC = encErbSeqState.transposed(0, 2, 3, 1)
+                let encDfSeqNHWC = encDfSeqState.transposed(0, 2, 3, 1)
 
-            let e0 = applyConvLast(input: encErbSeq, layer: encErbConv0)
-            let e1 = applyConvLast(input: e0, layer: encErbConv1)
-            let e2 = applyConvLast(input: e1, layer: encErbConv2)
-            let e3 = applyConvLast(input: e2, layer: encErbConv3)
+                e0 = applyConvLastNHWC(input: encErbSeqNHWC, layer: encErbConv0)
+                e1 = applyConvLastNHWC(input: e0, layer: encErbConv1)
+                e2 = applyConvLastNHWC(input: e1, layer: encErbConv2)
+                e3 = applyConvLastNHWC(input: e2, layer: encErbConv3)
 
-            let c0 = applyConvLast(input: encDfSeq, layer: encDfConv0)
-            let c1 = applyConvLast(input: c0, layer: encDfConv1)
+                c0 = applyConvLastNHWC(input: encDfSeqNHWC, layer: encDfConv0)
+                c1 = applyConvLastNHWC(input: c0, layer: encDfConv1)
 
-            var cemb = c1.transposed(0, 2, 3, 1).reshaped([1, 1, -1])
-            cemb = relu(model.groupedLinear(cemb, weight: encDfFcEmbWeight))
+                var cemb = c1.reshaped([1, 1, -1])
+                cemb = relu(model.groupedLinear(cemb, weight: encDfFcEmbWeight))
 
-            var emb = e3.transposed(0, 2, 3, 1).reshaped([1, 1, -1])
-            emb = model.config.encConcat ? MLX.concatenated([emb, cemb], axis: -1) : (emb + cemb)
+                emb = e3.reshaped([1, 1, -1])
+                emb = model.config.encConcat ? MLX.concatenated([emb, cemb], axis: -1) : (emb + cemb)
+            } else {
+                let encErbSeq = encErbSeqState
+                let encDfSeq = encDfSeqState
+
+                e0 = applyConvLast(input: encErbSeq, layer: encErbConv0)
+                e1 = applyConvLast(input: e0, layer: encErbConv1)
+                e2 = applyConvLast(input: e1, layer: encErbConv2)
+                e3 = applyConvLast(input: e2, layer: encErbConv3)
+
+                c0 = applyConvLast(input: encDfSeq, layer: encDfConv0)
+                c1 = applyConvLast(input: c0, layer: encDfConv1)
+
+                var cemb = c1.transposed(0, 2, 3, 1).reshaped([1, 1, -1])
+                cemb = relu(model.groupedLinear(cemb, weight: encDfFcEmbWeight))
+
+                emb = e3.transposed(0, 2, 3, 1).reshaped([1, 1, -1])
+                emb = model.config.encConcat ? MLX.concatenated([emb, cemb], axis: -1) : (emb + cemb)
+            }
             if enableProfiling, profilingForceEvalPerStage {
                 eval(e3, c1, emb)
             }
@@ -1123,7 +1178,14 @@ extension DeepFilterNetModel {
             let mask: MLXArray
             let tErb0 = enableProfiling ? CFAbsoluteTimeGetCurrent() : 0
             if applyGains {
-                mask = try erbDecoderStep(emb: emb, e3: e3, e2: e2, e1: e1, e0: e0)
+                mask = try erbDecoderStep(
+                    emb: emb,
+                    e3: e3,
+                    e2: e2,
+                    e1: e1,
+                    e0: e0,
+                    inputsAreNHWC: useCompiledNHWCEncode
+                )
             } else if applyGainZeros {
                 mask = zeroMaskFrameInference
             } else {
@@ -1141,7 +1203,8 @@ extension DeepFilterNetModel {
             }
 
             let tDf0 = enableProfiling ? CFAbsoluteTimeGetCurrent() : 0
-            let dfCoefsPacked = try dfDecoderStep(emb: emb, c0: c0)
+            let c0ForDf = useCompiledNHWCEncode ? c0.transposed(0, 3, 1, 2) : c0
+            let dfCoefsPacked = try dfDecoderStep(emb: emb, c0: c0ForDf)
 
             let specEnhanced = try deepFilterAssignPacked(
                 spec: specMX,
@@ -1198,6 +1261,28 @@ extension DeepFilterNetModel {
             y = relu(y)
             let t = y.shape[2]
             return y[0..., 0..., (t - 1)..<t, 0...]
+        }
+
+        func applyConvLastNHWC(input: MLXArray, layer: StreamConvLayer) -> MLXArray {
+            var y = DeepFilterNetModel.conv2dNHWC(
+                input,
+                weightOHWI: layer.mainWeightOHWI,
+                bias: nil,
+                fstride: layer.fstride,
+                lookahead: 0
+            )
+            if let pointwiseWeightOHWI = layer.pointwiseWeightOHWI {
+                y = DeepFilterNetModel.conv2dNHWC(
+                    y,
+                    weightOHWI: pointwiseWeightOHWI,
+                    bias: nil,
+                    fstride: 1,
+                    lookahead: 0
+                )
+            }
+            y = relu(y * layer.bnScaleNHWC + layer.bnBiasNHWC)
+            let t = y.shape[1]
+            return y[0..., (t - 1)..<t, 0..., 0...]
         }
 
         func squeezedGRUStep(
@@ -1310,28 +1395,57 @@ extension DeepFilterNetModel {
             e3: MLXArray,
             e2: MLXArray,
             e1: MLXArray,
-            e0: MLXArray
+            e0: MLXArray,
+            inputsAreNHWC: Bool = false
         ) throws -> MLXArray {
-            var embDec = squeezedGRUStep(
+            let embDecStep = squeezedGRUStep(
                 emb,
                 gru: erbDecEmbGRU,
                 hiddenSize: model.config.embHiddenDim,
                 state: &recurrentState.erbDec
             )
-            let f8 = e3.shape[3]
-            embDec = embDec.reshaped([1, 1, f8, -1]).transposed(0, 3, 1, 2)
-
-            if let compiledStreamErbDecoderStep {
-                return compiledStreamErbDecoderStep([embDec, e3, e2, e1, e0])[0]
+            let e3BCHW: MLXArray
+            let e2BCHW: MLXArray
+            let e1BCHW: MLXArray
+            let e0BCHW: MLXArray
+            let embDec: MLXArray
+            if inputsAreNHWC {
+                let f8 = e3.shape[2]
+                let embDecNHWC = embDecStep.reshaped([1, 1, f8, -1])
+                if let compiledStreamErbDecoderStep {
+                    return compiledStreamErbDecoderStep([embDecNHWC, e3, e2, e1, e0])[0]
+                }
+                embDec = embDecNHWC.transposed(0, 3, 1, 2)
+                e3BCHW = e3.transposed(0, 3, 1, 2)
+                e2BCHW = e2.transposed(0, 3, 1, 2)
+                e1BCHW = e1.transposed(0, 3, 1, 2)
+                e0BCHW = e0.transposed(0, 3, 1, 2)
+            } else {
+                let f8 = e3.shape[3]
+                let embDecNHWC = embDecStep.reshaped([1, 1, f8, -1])
+                if let compiledStreamErbDecoderStep {
+                    return compiledStreamErbDecoderStep([
+                        embDecNHWC,
+                        e3.transposed(0, 2, 3, 1),
+                        e2.transposed(0, 2, 3, 1),
+                        e1.transposed(0, 2, 3, 1),
+                        e0.transposed(0, 2, 3, 1),
+                    ])[0]
+                }
+                embDec = embDecNHWC.transposed(0, 3, 1, 2)
+                e3BCHW = e3
+                e2BCHW = e2
+                e1BCHW = e1
+                e0BCHW = e0
             }
 
-            var d3 = relu(try model.applyPathwayConv(e3, prefix: "erb_dec.conv3p")) + embDec
+            var d3 = relu(try model.applyPathwayConv(e3BCHW, prefix: "erb_dec.conv3p")) + embDec
             d3 = relu(try model.applyRegularBlock(d3, prefix: "erb_dec.convt3"))
-            var d2 = relu(try model.applyPathwayConv(e2, prefix: "erb_dec.conv2p")) + d3
+            var d2 = relu(try model.applyPathwayConv(e2BCHW, prefix: "erb_dec.conv2p")) + d3
             d2 = relu(try model.applyTransposeBlock(d2, prefix: "erb_dec.convt2", fstride: 2))
-            var d1 = relu(try model.applyPathwayConv(e1, prefix: "erb_dec.conv1p")) + d2
+            var d1 = relu(try model.applyPathwayConv(e1BCHW, prefix: "erb_dec.conv1p")) + d2
             d1 = relu(try model.applyTransposeBlock(d1, prefix: "erb_dec.convt1", fstride: 2))
-            let d0 = relu(try model.applyPathwayConv(e0, prefix: "erb_dec.conv0p")) + d1
+            let d0 = relu(try model.applyPathwayConv(e0BCHW, prefix: "erb_dec.conv0p")) + d1
             let out = try model.applyOutputConv(d0, prefix: "erb_dec.conv0_out")
             return sigmoid(out)
         }
@@ -1347,12 +1461,8 @@ extension DeepFilterNetModel {
                 c = c + model.groupedLinear(emb, weight: dfDecSkipWeight)
             }
 
-            rings.dfConvp.push(c0)
-            let c0Seq = historyTensor(
-                from: rings.dfConvp,
-                requiredCount: dfConvpKernelSizeT,
-                zeroFrame: zeroDfConvpFrame
-            )
+            dfConvpSeqState = Self.appendTimeFrame(dfConvpSeqState, frame: c0)
+            let c0Seq = dfConvpSeqState
             let c0p: MLXArray
             if let compiledStreamDfConvpStep {
                 c0p = compiledStreamDfConvpStep([c0Seq])[0]
@@ -1487,6 +1597,23 @@ extension DeepFilterNetModel {
             let lowAssigned = specDf[0..., 0..., 0..., 0..<nbDf, 0...]
             let highMasked = specMasked[0..., 0..., 0..., nbDf..., 0...]
             return MLX.concatenated([lowAssigned, highMasked], axis: 3)
+        }
+
+        @inline(__always)
+        static func appendTimeFrame(_ history: MLXArray, frame: MLXArray) -> MLXArray {
+            let t = history.shape[2]
+            if t <= 1 {
+                return frame
+            }
+            return MLX.concatenated([history[0..., 0..., 1..<t, 0...], frame], axis: 2)
+        }
+
+        static func repeatedSequence(frame: MLXArray, count: Int) -> MLXArray {
+            precondition(count > 0, "sequence count must be > 0")
+            if count == 1 {
+                return frame
+            }
+            return MLX.concatenated(Array(repeating: frame, count: count), axis: 2)
         }
 
         func historyTensor(

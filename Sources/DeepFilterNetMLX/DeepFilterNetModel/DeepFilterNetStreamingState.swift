@@ -1,6 +1,6 @@
 import MLX
 
-struct TensorRingBuffer {
+final class TensorRingBuffer {
     private(set) var values: [MLXArray]
     private(set) var totalWritten: Int = 0
 
@@ -13,15 +13,18 @@ struct TensorRingBuffer {
         values = Array(repeating: initial, count: capacity)
     }
 
-    mutating func reset() {
+    @inline(__always)
+    func reset() {
         totalWritten = 0
     }
 
-    mutating func push(_ value: MLXArray) {
+    @inline(__always)
+    func push(_ value: MLXArray) {
         values[totalWritten % capacity] = value
         totalWritten += 1
     }
 
+    @inline(__always)
     func get(absoluteIndex: Int) -> MLXArray? {
         guard absoluteIndex >= oldestAbsoluteIndex, absoluteIndex < totalWritten else {
             return nil
@@ -37,14 +40,29 @@ struct TensorRingBuffer {
     }
 }
 
-struct DeepFilterNetStreamingRings {
-    var spec: TensorRingBuffer
-    var specLow: TensorRingBuffer
-    var encErb: TensorRingBuffer
-    var encDf: TensorRingBuffer
-    var dfConvp: TensorRingBuffer
+final class DeepFilterNetStreamingRings {
+    let spec: TensorRingBuffer
+    let specLow: TensorRingBuffer
+    let encErb: TensorRingBuffer
+    let encDf: TensorRingBuffer
+    let dfConvp: TensorRingBuffer
 
-    mutating func reset() {
+    init(
+        spec: TensorRingBuffer,
+        specLow: TensorRingBuffer,
+        encErb: TensorRingBuffer,
+        encDf: TensorRingBuffer,
+        dfConvp: TensorRingBuffer
+    ) {
+        self.spec = spec
+        self.specLow = specLow
+        self.encErb = encErb
+        self.encDf = encDf
+        self.dfConvp = dfConvp
+    }
+
+    @inline(__always)
+    func reset() {
         spec.reset()
         specLow.reset()
         encErb.reset()
@@ -53,12 +71,13 @@ struct DeepFilterNetStreamingRings {
     }
 }
 
-struct DeepFilterNetStreamRecurrentState {
+final class DeepFilterNetStreamRecurrentState {
     var encEmb: [MLXArray]?
     var erbDec: [MLXArray]?
     var dfDec: [MLXArray]?
 
-    mutating func reset() {
+    @inline(__always)
+    func reset() {
         encEmb = nil
         erbDec = nil
         dfDec = nil

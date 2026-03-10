@@ -133,10 +133,28 @@ extension DeepFilterNetModel {
         fstride: Int,
         lookahead: Int
     ) -> MLXArray {
+        let xNHWC = xBCHW.transposed(0, 2, 3, 1)
+        let yNHWC = conv2dNHWC(
+            xNHWC,
+            weightOHWI: weightOHWI,
+            bias: bias,
+            fstride: fstride,
+            lookahead: lookahead
+        )
+        return yNHWC.transposed(0, 3, 1, 2)
+    }
+
+    static func conv2dNHWC(
+        _ xNHWC: MLXArray,
+        weightOHWI: MLXArray,
+        bias: MLXArray?,
+        fstride: Int,
+        lookahead: Int
+    ) -> MLXArray {
         let kT = weightOHWI.shape[1]
         let kF = weightOHWI.shape[2]
         let inPerGroup = weightOHWI.shape[3]
-        let inChannels = xBCHW.shape[1]
+        let inChannels = xNHWC.shape[3]
         let groups = max(1, inChannels / max(1, inPerGroup))
 
         let rawLeft = kT - 1 - lookahead
@@ -145,7 +163,7 @@ extension DeepFilterNetModel {
         let timePadRight = max(0, lookahead)
         let freqPad = kF / 2
 
-        var x = xBCHW.transposed(0, 2, 3, 1)  // NHWC
+        var x = xNHWC
         if timeCrop > 0, x.shape[1] > timeCrop {
             x = x[0..., timeCrop..., 0..., 0...]
         }
@@ -164,7 +182,7 @@ extension DeepFilterNetModel {
         if let bias {
             y = y + bias.reshaped([1, 1, 1, bias.shape[0]])
         }
-        return y.transposed(0, 3, 1, 2)
+        return y
     }
 
     static func convTranspose2dBCHWDense(
@@ -172,7 +190,21 @@ extension DeepFilterNetModel {
         denseWeight: MLXArray,
         fstride: Int
     ) -> MLXArray {
-        var x = xBCHW.transposed(0, 2, 3, 1)  // NHWC
+        let xNHWC = xBCHW.transposed(0, 2, 3, 1)
+        let yNHWC = convTranspose2dNHWCDense(
+            xNHWC,
+            denseWeight: denseWeight,
+            fstride: fstride
+        )
+        return yNHWC.transposed(0, 3, 1, 2)
+    }
+
+    static func convTranspose2dNHWCDense(
+        _ xNHWC: MLXArray,
+        denseWeight: MLXArray,
+        fstride: Int
+    ) -> MLXArray {
+        var x = xNHWC
         let kT = denseWeight.shape[1]
         let kF = denseWeight.shape[2]
         let padding = IntOrPair((kT - 1, kF / 2))
@@ -185,7 +217,7 @@ extension DeepFilterNetModel {
             outputPadding: outputPadding,
             groups: 1
         )
-        return x.transposed(0, 3, 1, 2)
+        return x
     }
 
     func conv2dLayer(

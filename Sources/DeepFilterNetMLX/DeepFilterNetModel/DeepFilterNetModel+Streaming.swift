@@ -36,43 +36,6 @@ extension DeepFilterNetModel {
             let fstride: Int
         }
 
-        struct StaticRing {
-            private(set) var values: [MLXArray]
-            private(set) var totalWritten: Int = 0
-
-            var capacity: Int { values.count }
-            var count: Int { min(totalWritten, capacity) }
-            var oldestAbsoluteIndex: Int { max(0, totalWritten - capacity) }
-
-            init(capacity: Int, initial: MLXArray) {
-                precondition(capacity > 0, "StaticRing capacity must be > 0")
-                values = Array(repeating: initial, count: capacity)
-            }
-
-            mutating func reset() {
-                totalWritten = 0
-            }
-
-            mutating func push(_ value: MLXArray) {
-                values[totalWritten % capacity] = value
-                totalWritten += 1
-            }
-
-            func get(absoluteIndex: Int) -> MLXArray? {
-                guard absoluteIndex >= oldestAbsoluteIndex, absoluteIndex < totalWritten else {
-                    return nil
-                }
-                return values[absoluteIndex % capacity]
-            }
-
-            func orderedLast(_ n: Int) -> [MLXArray] {
-                let k = min(max(0, n), totalWritten)
-                guard k > 0 else { return [] }
-                let start = totalWritten - k
-                return (start..<(start + k)).compactMap { get(absoluteIndex: $0) }
-            }
-        }
-
         let model: DeepFilterNetModel
         public let config: DeepFilterNetStreamingConfig
 
@@ -132,15 +95,8 @@ extension DeepFilterNetModel {
         var erbState: MLXArray
         var dfState: MLXArray
 
-        var specRing: StaticRing
-        var specLowRing: StaticRing
-        var encErbFrameRing: StaticRing
-        var encDfFrameRing: StaticRing
-        var dfConvpFrameRing: StaticRing
-
-        var encEmbState: [MLXArray]?
-        var erbDecState: [MLXArray]?
-        var dfDecState: [MLXArray]?
+        var rings: DeepFilterNetStreamingRings
+        var recurrentState = DeepFilterNetStreamRecurrentState()
 
         var delayDropped = 0
         var hopsSinceMaterialize = 0
@@ -271,11 +227,13 @@ extension DeepFilterNetModel {
             self.synthMem = MLXArray.zeros([synthMemCount], type: Float.self)
             self.erbState = MLXArray(Self.linspace(start: -60.0, end: -90.0, count: model.config.nbErb))
             self.dfState = MLXArray(Self.linspace(start: 0.001, end: 0.0001, count: model.config.nbDf))
-            self.specRing = StaticRing(capacity: specRingCapacity, initial: zeroSpecFrame)
-            self.specLowRing = StaticRing(capacity: specRingCapacity, initial: zeroSpecLowFrameInference)
-            self.encErbFrameRing = StaticRing(capacity: 3, initial: zeroEncErbFrame)
-            self.encDfFrameRing = StaticRing(capacity: 3, initial: zeroEncDfFrame)
-            self.dfConvpFrameRing = StaticRing(capacity: max(1, dfConvpKernelSizeT), initial: zeroDfConvpFrame)
+            self.rings = DeepFilterNetStreamingRings(
+                spec: TensorRingBuffer(capacity: specRingCapacity, initial: zeroSpecFrame),
+                specLow: TensorRingBuffer(capacity: specRingCapacity, initial: zeroSpecLowFrameInference),
+                encErb: TensorRingBuffer(capacity: 3, initial: zeroEncErbFrame),
+                encDf: TensorRingBuffer(capacity: 3, initial: zeroEncDfFrame),
+                dfConvp: TensorRingBuffer(capacity: max(1, dfConvpKernelSizeT), initial: zeroDfConvpFrame)
+            )
             if model.performanceConfig.preferCompiledGraphs {
                 if let erbFB = self.erbFBFrame {
                     self.compiledAnalysisFeatureStep = Self.buildCompiledAnalysisFeatureStep(
@@ -738,14 +696,8 @@ extension DeepFilterNetModel {
             synthMem = MLXArray.zeros([synthMemCount], type: Float.self)
             erbState = MLXArray(Self.linspace(start: -60.0, end: -90.0, count: nbErb))
             dfState = MLXArray(Self.linspace(start: 0.001, end: 0.0001, count: nbDf))
-            specRing.reset()
-            specLowRing.reset()
-            encErbFrameRing.reset()
-            encDfFrameRing.reset()
-            dfConvpFrameRing.reset()
-            encEmbState = nil
-            erbDecState = nil
-            dfDecState = nil
+            rings.reset()
+            recurrentState.reset()
             delayDropped = 0
             hopsSinceMaterialize = 0
             profHopCount = 0
@@ -932,16 +884,16 @@ extension DeepFilterNetModel {
                 // Combined path; attribute to analysis bucket for continuity.
                 profAnalysisSeconds += dt
             }
-            specRing.push(spec)
-            specLowRing.push(spec[0..<nbDf, 0...].asType(inferenceDType))
-            encErbFrameRing.push(featErb.asType(inferenceDType))
-            encDfFrameRing.push(featDf.asType(inferenceDType))
+            rings.spec.push(spec)
+            rings.specLow.push(spec[0..<nbDf, 0...].asType(inferenceDType))
+            rings.encErb.push(featErb.asType(inferenceDType))
+            rings.encDf.push(featDf.asType(inferenceDType))
 
-            if specRing.totalWritten <= convLookahead {
+            if rings.spec.totalWritten <= convLookahead {
                 return nil
             }
-            let targetFrameIndex = specRing.totalWritten - 1 - convLookahead
-            guard let specT = specRing.get(absoluteIndex: targetFrameIndex) else {
+            let targetFrameIndex = rings.spec.totalWritten - 1 - convLookahead
+            guard let specT = rings.spec.get(absoluteIndex: targetFrameIndex) else {
                 return nil
             }
             let dfSpecHistory = dfSpecHistoryForTargetFrame(targetFrameIndex)
@@ -1112,12 +1064,12 @@ extension DeepFilterNetModel {
                 .asType(inferenceDType)
 
             let encErbSeq = historyTensor(
-                from: encErbFrameRing,
+                from: rings.encErb,
                 requiredCount: 3,
                 zeroFrame: zeroEncErbFrame
             )
             let encDfSeq = historyTensor(
-                from: encDfFrameRing,
+                from: rings.encDf,
                 requiredCount: 3,
                 zeroFrame: zeroEncDfFrame
             )
@@ -1147,7 +1099,7 @@ extension DeepFilterNetModel {
                 emb,
                 gru: encEmbGRU,
                 hiddenSize: model.config.embHiddenDim,
-                state: &encEmbState
+                state: &recurrentState.encEmb
             )
 
             let applyGains: Bool
@@ -1364,7 +1316,7 @@ extension DeepFilterNetModel {
                 emb,
                 gru: erbDecEmbGRU,
                 hiddenSize: model.config.embHiddenDim,
-                state: &erbDecState
+                state: &recurrentState.erbDec
             )
             let f8 = e3.shape[3]
             embDec = embDec.reshaped([1, 1, f8, -1]).transposed(0, 3, 1, 2)
@@ -1389,15 +1341,15 @@ extension DeepFilterNetModel {
                 emb,
                 gru: dfDecGRU,
                 hiddenSize: model.config.dfHiddenDim,
-                state: &dfDecState
+                state: &recurrentState.dfDec
             )
             if let dfDecSkipWeight {
                 c = c + model.groupedLinear(emb, weight: dfDecSkipWeight)
             }
 
-            dfConvpFrameRing.push(c0)
+            rings.dfConvp.push(c0)
             let c0Seq = historyTensor(
-                from: dfConvpFrameRing,
+                from: rings.dfConvp,
                 requiredCount: dfConvpKernelSizeT,
                 zeroFrame: zeroDfConvpFrame
             )
@@ -1538,7 +1490,7 @@ extension DeepFilterNetModel {
         }
 
         func historyTensor(
-            from ring: StaticRing,
+            from ring: TensorRingBuffer,
             requiredCount: Int,
             zeroFrame: MLXArray
         ) -> MLXArray {
@@ -1566,7 +1518,7 @@ extension DeepFilterNetModel {
             frames.reserveCapacity(dfOrder)
             for k in 0..<dfOrder {
                 let absoluteIndex = targetFrameIndex - dfSpecLeft + k
-                if let frame = specLowRing.get(absoluteIndex: absoluteIndex) {
+                if let frame = rings.specLow.get(absoluteIndex: absoluteIndex) {
                     frames.append(frame)
                 } else {
                     frames.append(zeroSpecLowFrameInference)
@@ -1578,14 +1530,14 @@ extension DeepFilterNetModel {
         // Materialize recurrent tensors each hop so MLX does not keep growing a long lazy graph.
         func materializeStreamingState(output: MLXArray) {
             eval(output, analysisMem, synthMem, erbState, dfState)
-            if let encEmbState {
-                for x in encEmbState { eval(x) }
+            if let encEmb = recurrentState.encEmb {
+                for x in encEmb { eval(x) }
             }
-            if let erbDecState {
-                for x in erbDecState { eval(x) }
+            if let erbDec = recurrentState.erbDec {
+                for x in erbDec { eval(x) }
             }
-            if let dfDecState {
-                for x in dfDecState { eval(x) }
+            if let dfDec = recurrentState.dfDec {
+                for x in dfDec { eval(x) }
             }
         }
 

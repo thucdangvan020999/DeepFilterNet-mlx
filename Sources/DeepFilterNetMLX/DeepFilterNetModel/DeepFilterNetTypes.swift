@@ -68,7 +68,7 @@ public struct DeepFilterNetStreamingConfig: Sendable {
         maxDbDfThresh: Float = 20.0,
         enableProfiling: Bool = false,
         profilingForceEvalPerStage: Bool = false,
-        materializeEveryHops: Int = 96
+        materializeEveryHops: Int = 512
     ) {
         self.padEndFrames = padEndFrames
         self.compensateDelay = compensateDelay

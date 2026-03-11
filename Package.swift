@@ -6,7 +6,9 @@ let package = Package(
     platforms: [.macOS(.v14), .iOS(.v17)],
     products: [
         .library(name: "DeepFilterNetMLX", targets: ["DeepFilterNetMLX"]),
+        .library(name: "DeepFilterNetBenchmark", targets: ["DeepFilterNetBenchmark"]),
         .executable(name: "deepfilternet-mlx", targets: ["deepfilternet-mlx"]),
+        .executable(name: "deepfilternet-benchmark", targets: ["deepfilternet-benchmark"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", .upToNextMajor(from: "0.30.6")),
@@ -32,6 +34,26 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Sources/deepfilternet-mlx-cli"
+        ),
+        .target(
+            name: "DeepFilterNetBenchmark",
+            dependencies: [
+                "DeepFilterNetMLX",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
+            ],
+            path: "Sources/DeepFilterNetBenchmark"
+        ),
+        .executableTarget(
+            name: "deepfilternet-benchmark",
+            dependencies: [
+                "DeepFilterNetBenchmark",
+                "DeepFilterNetMLX",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Sources/deepfilternet-benchmark-cli"
         ),
         .testTarget(
             name: "DeepFilterNetMLXTests",

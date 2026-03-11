@@ -17,22 +17,22 @@ public final class DeepFilterNetModel {
     public var sampleRate: Int { config.sampleRate }
     public var performanceConfig: DeepFilterNetPerformanceConfig
 
-    let weights: [String: MLXArray]
-    let erbFB: MLXArray
-    let erbInvFB: MLXArray
-    let erbInvFBF32: MLXArray
-    let erbInvFBF16: MLXArray
-    let erbBandWidths: [Int]
-    let vorbisWindow: MLXArray
-    let wnorm: Float
-    let normAlphaValue: Float
-    let inferenceDType: DType
-    let bnScale: [String: MLXArray]
-    let bnBias: [String: MLXArray]
-    let conv2dWeightsOHWI: [String: MLXArray]
-    let convTransposeDenseWeights: [String: MLXArray]
-    let convTransposeGroupWeights: [String: [MLXArray]]
-    let gruTransposedWeights: [String: MLXArray]
+    public let weights: [String: MLXArray]
+    public let erbFB: MLXArray
+    public let erbInvFB: MLXArray
+    public let erbInvFBF32: MLXArray
+    public let erbInvFBF16: MLXArray
+    public let erbBandWidths: [Int]
+    public let vorbisWindow: MLXArray
+    public let wnorm: Float
+    public let normAlphaValue: Float
+    public let inferenceDType: DType
+    public let bnScale: [String: MLXArray]
+    public let bnBias: [String: MLXArray]
+    public let conv2dWeightsOHWI: [String: MLXArray]
+    public let convTransposeDenseWeights: [String: MLXArray]
+    public let convTransposeGroupWeights: [String: [MLXArray]]
+    public let gruTransposedWeights: [String: MLXArray]
     struct V1GroupedLinearPack {
         let weightGIO: MLXArray  // [G, I, O]
         let biasGO: MLXArray  // [G, O]

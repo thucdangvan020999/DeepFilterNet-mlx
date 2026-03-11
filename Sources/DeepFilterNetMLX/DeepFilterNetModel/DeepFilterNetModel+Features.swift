@@ -98,7 +98,7 @@ extension DeepFilterNetModel {
         )
     }
 
-    func normAlpha() -> Float {
+    public func normAlpha() -> Float {
         normAlphaValue
     }
 

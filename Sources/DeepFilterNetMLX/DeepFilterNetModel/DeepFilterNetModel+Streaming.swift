@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 import HuggingFace
 import MLX
@@ -14,11 +15,29 @@ extension DeepFilterNetModel {
             let bhh: MLXArray
             var compiledStepCache: [String: (@Sendable ([MLXArray]) -> [MLXArray])] = [:]
 
+            // Pre-extracted CPU arrays for Accelerate GRU path
+            let cpuWIH: [Float]
+            let cpuWHH: [Float]
+            let cpuBiasIH: [Float]
+            let cpuBiasHH: [Float]
+            let inputSize: Int
+            let hiddenSize: Int
+
             init(wihT: MLXArray, whhT: MLXArray, bih: MLXArray, bhh: MLXArray) {
                 self.wihT = wihT
                 self.whhT = whhT
                 self.bih = bih
                 self.bhh = bhh
+
+                // Pre-extract weights to CPU for Accelerate path
+                eval(wihT, whhT, bih, bhh)
+                self.cpuWIH = wihT.asType(.float32).reshaped([-1]).asArray(Float.self)
+                self.cpuWHH = whhT.asType(.float32).reshaped([-1]).asArray(Float.self)
+                self.cpuBiasIH = bih.asType(.float32).reshaped([-1]).asArray(Float.self)
+                self.cpuBiasHH = bhh.asType(.float32).reshaped([-1]).asArray(Float.self)
+                // wihT shape: [inputSize, 3*hiddenSize]
+                self.inputSize = wihT.shape[0]
+                self.hiddenSize = wihT.shape[1] / 3
             }
         }
 
@@ -1321,6 +1340,11 @@ extension DeepFilterNetModel {
         ) -> MLXArray {
             let xt = x[0..., 0, 0...]
 
+            // Note: Accelerate GRU is NOT used for streaming. The CPU↔GPU
+            // transfer per hop (~2ms overhead) exceeds the GPU dispatch savings.
+            // Accelerate GRU is only beneficial for offline (batch) processing
+            // where it avoids hundreds of sequential GPU dispatches.
+
             if model.performanceConfig.enableMetalFusedGRUGates,
                xt.dtype == prevState.dtype,
                (xt.dtype == .float32 || xt.dtype == .float16)
@@ -1388,6 +1412,81 @@ extension DeepFilterNetModel {
             let n = tanh(xn + r * hn)
             let one = MLXArray(Float(1.0)).asType(xt.dtype)
             return (one - z) * n + z * prevState
+        }
+
+        /// Accelerate-optimized single GRU step: both input and hidden projections
+        /// on CPU via vDSP_mmul, scalar GRU gates. For streaming, both projections
+        /// are small (single timestep), so CPU is faster than GPU dispatch.
+        func accelerateGRUStep(
+            xt: MLXArray,
+            layer: StreamGRULayer,
+            hiddenSize: Int,
+            prevState: MLXArray
+        ) -> MLXArray {
+            let batchSize = xt.shape[0]
+            let inputSize = layer.inputSize
+            let h3 = 3 * hiddenSize
+
+            // Materialize dynamic inputs to CPU (weights are pre-cached)
+            eval(xt, prevState)
+            let xtFlat = xt.asType(.float32).reshaped([-1]).asArray(Float.self)
+            let hFlat = prevState.asType(.float32).reshaped([-1]).asArray(Float.self)
+
+            var newState = Array<Float>(repeating: 0, count: batchSize * hiddenSize)
+            var gxBuf = Array<Float>(repeating: 0, count: h3)
+            var ghBuf = Array<Float>(repeating: 0, count: h3)
+
+            for bi in 0..<batchSize {
+                let xtOff = bi * inputSize
+                let stOff = bi * hiddenSize
+
+                // gx = xt @ wIH (input projection via Accelerate)
+                xtFlat.withUnsafeBufferPointer { xBuf in
+                    layer.cpuWIH.withUnsafeBufferPointer { wBuf in
+                        gxBuf.withUnsafeMutableBufferPointer { gBuf in
+                            vDSP_mmul(
+                                xBuf.baseAddress! + xtOff, 1,
+                                wBuf.baseAddress!, 1,
+                                gBuf.baseAddress!, 1,
+                                vDSP_Length(1), vDSP_Length(h3), vDSP_Length(inputSize)
+                            )
+                        }
+                    }
+                }
+
+                // gh = h @ wHH (hidden projection via Accelerate)
+                hFlat.withUnsafeBufferPointer { sBuf in
+                    layer.cpuWHH.withUnsafeBufferPointer { wBuf in
+                        ghBuf.withUnsafeMutableBufferPointer { gBuf in
+                            vDSP_mmul(
+                                sBuf.baseAddress! + stOff, 1,
+                                wBuf.baseAddress!, 1,
+                                gBuf.baseAddress!, 1,
+                                vDSP_Length(1), vDSP_Length(h3), vDSP_Length(hiddenSize)
+                            )
+                        }
+                    }
+                }
+
+                // GRU gates (PyTorch convention: (1-z)*n + z*h)
+                let biasIH = layer.cpuBiasIH
+                let biasHH = layer.cpuBiasHH
+                for k in 0..<hiddenSize {
+                    let xr = gxBuf[k] + biasIH[k]
+                    let xz = gxBuf[hiddenSize + k] + biasIH[hiddenSize + k]
+                    let xn = gxBuf[2 * hiddenSize + k] + biasIH[2 * hiddenSize + k]
+                    let hr = ghBuf[k] + biasHH[k]
+                    let hz = ghBuf[hiddenSize + k] + biasHH[hiddenSize + k]
+                    let hn = ghBuf[2 * hiddenSize + k] + biasHH[2 * hiddenSize + k]
+
+                    let r = 1.0 / (1.0 + expf(-(xr + hr)))
+                    let z = 1.0 / (1.0 + expf(-(xz + hz)))
+                    let n = tanhf(xn + r * hn)
+                    newState[stOff + k] = (1.0 - z) * n + z * hFlat[stOff + k]
+                }
+            }
+
+            return MLXArray(newState).reshaped([batchSize, hiddenSize])
         }
 
         func erbDecoderStep(

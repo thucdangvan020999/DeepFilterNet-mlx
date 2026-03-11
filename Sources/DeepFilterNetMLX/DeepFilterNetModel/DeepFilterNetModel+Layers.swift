@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 import HuggingFace
 import MLX
@@ -473,6 +474,20 @@ extension DeepFilterNetModel {
         let bih = try w("\(prefix).bias_ih_l\(layer)")
         let bhh = try w("\(prefix).bias_hh_l\(layer)")
 
+        // Accelerate-optimized path: batch input projection on GPU, per-step
+        // hidden projection on CPU via vDSP_mmul. Avoids hundreds of tiny GPU
+        // dispatches for the recurrent loop.
+        if performanceConfig.enableAccelerateGRU {
+            return accelerateGRULayer(
+                x,
+                hiddenSize: hiddenSize,
+                wihT: wihT,
+                whhT: whhT,
+                bih: bih,
+                bhh: bhh
+            )
+        }
+
         if performanceConfig.preferCompiledGraphs, x.shape[1] <= 256 {
             return compiledPytorchGRULayer(
                 x,
@@ -515,6 +530,80 @@ extension DeepFilterNetModel {
             states.append(h)
         }
         return MLX.stacked(states, axis: 1)
+    }
+
+    /// Accelerate-optimized GRU: batch input projection on GPU, then per-step
+    /// hidden projection on CPU via vDSP_mmul with scalar GRU gate computation.
+    func accelerateGRULayer(
+        _ x: MLXArray,
+        hiddenSize: Int,
+        wihT: MLXArray,
+        whhT: MLXArray,
+        bih: MLXArray,
+        bhh: MLXArray
+    ) -> MLXArray {
+        let batchSize = x.shape[0]
+        let t = x.shape[1]
+        let h3 = 3 * hiddenSize
+
+        // Batch input projection on GPU: gxAll[B, T, 3H] = x @ wihT + bih
+        let x2D = x.reshaped([batchSize * t, x.shape[2]])
+        let gxAllMLX = (MLX.matmul(x2D, wihT) + bih).reshaped([batchSize, t, h3])
+        eval(gxAllMLX)
+
+        // Extract to CPU arrays
+        let gxAll = gxAllMLX.asType(.float32).reshaped([-1]).asArray(Float.self)
+        let wHH = whhT.asType(.float32).reshaped([-1]).asArray(Float.self)
+        let biasHH = bhh.asType(.float32).reshaped([-1]).asArray(Float.self)
+
+        let totalOut = batchSize * t * hiddenSize
+        var output = Array<Float>(repeating: 0, count: totalOut)
+        var state = Array<Float>(repeating: 0, count: batchSize * hiddenSize)
+        var ghBuf = Array<Float>(repeating: 0, count: h3)
+
+        for ti in 0..<t {
+            for bi in 0..<batchSize {
+                let stOff = bi * hiddenSize
+                let gxOff = (bi * t + ti) * h3
+
+                // gh = state @ wHH (hidden projection via Accelerate)
+                state.withUnsafeBufferPointer { sBuf in
+                    wHH.withUnsafeBufferPointer { wBuf in
+                        ghBuf.withUnsafeMutableBufferPointer { gBuf in
+                            vDSP_mmul(
+                                sBuf.baseAddress! + stOff, 1,
+                                wBuf.baseAddress!, 1,
+                                gBuf.baseAddress!, 1,
+                                vDSP_Length(1), vDSP_Length(h3), vDSP_Length(hiddenSize)
+                            )
+                        }
+                    }
+                }
+
+                // GRU gates (PyTorch convention: (1-z)*n + z*h)
+                for k in 0..<hiddenSize {
+                    let xr = gxAll[gxOff + k]
+                    let xz = gxAll[gxOff + hiddenSize + k]
+                    let xn = gxAll[gxOff + 2 * hiddenSize + k]
+                    let hr = ghBuf[k] + biasHH[k]
+                    let hz = ghBuf[hiddenSize + k] + biasHH[hiddenSize + k]
+                    let hn = ghBuf[2 * hiddenSize + k] + biasHH[2 * hiddenSize + k]
+
+                    let r = 1.0 / (1.0 + expf(-(xr + hr)))
+                    let z = 1.0 / (1.0 + expf(-(xz + hz)))
+                    let n = tanhf(xn + r * hn)
+                    state[stOff + k] = (1.0 - z) * n + z * state[stOff + k]
+                }
+
+                let outOff = (bi * t + ti) * hiddenSize
+                output.replaceSubrange(
+                    outOff..<(outOff + hiddenSize),
+                    with: state[stOff..<(stOff + hiddenSize)]
+                )
+            }
+        }
+
+        return MLXArray(output).reshaped([batchSize, t, hiddenSize])
     }
 
     func compiledPytorchGRULayer(

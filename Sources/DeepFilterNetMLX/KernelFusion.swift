@@ -8,6 +8,7 @@ public struct DeepFilterNetPerformanceConfig: Sendable {
     public var enableMetalFusedStreamingDeepFilter: Bool
     public var enableMetalFusedOfflineDeepFilter: Bool
     public var enableMetalFusedGRUGates: Bool
+    public var enableAccelerateGRU: Bool
     public var preferCompiledGraphs: Bool
     public var ensureKernelContiguousInputs: Bool
     public var kernelThreadGroupSize: Int
@@ -18,6 +19,7 @@ public struct DeepFilterNetPerformanceConfig: Sendable {
         enableMetalFusedStreamingDeepFilter: Bool = true,
         enableMetalFusedOfflineDeepFilter: Bool = true,
         enableMetalFusedGRUGates: Bool = true,
+        enableAccelerateGRU: Bool = true,
         preferCompiledGraphs: Bool = false,
         ensureKernelContiguousInputs: Bool = true,
         kernelThreadGroupSize: Int = 256
@@ -27,6 +29,7 @@ public struct DeepFilterNetPerformanceConfig: Sendable {
         self.enableMetalFusedStreamingDeepFilter = enableMetalFusedStreamingDeepFilter
         self.enableMetalFusedOfflineDeepFilter = enableMetalFusedOfflineDeepFilter
         self.enableMetalFusedGRUGates = enableMetalFusedGRUGates
+        self.enableAccelerateGRU = enableAccelerateGRU
         self.preferCompiledGraphs = preferCompiledGraphs
         self.ensureKernelContiguousInputs = ensureKernelContiguousInputs
         self.kernelThreadGroupSize = max(32, kernelThreadGroupSize)
@@ -38,6 +41,7 @@ public struct DeepFilterNetPerformanceConfig: Sendable {
         enableMetalFusedStreamingDeepFilter: true,
         enableMetalFusedOfflineDeepFilter: true,
         enableMetalFusedGRUGates: true,
+        enableAccelerateGRU: true,
         preferCompiledGraphs: true,
         ensureKernelContiguousInputs: true,
         kernelThreadGroupSize: 256
@@ -49,6 +53,7 @@ public struct DeepFilterNetPerformanceConfig: Sendable {
         enableMetalFusedStreamingDeepFilter: false,
         enableMetalFusedOfflineDeepFilter: false,
         enableMetalFusedGRUGates: false,
+        enableAccelerateGRU: false,
         preferCompiledGraphs: false,
         ensureKernelContiguousInputs: true,
         kernelThreadGroupSize: 128

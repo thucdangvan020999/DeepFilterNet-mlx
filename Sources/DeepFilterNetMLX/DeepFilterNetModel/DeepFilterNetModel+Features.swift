@@ -6,40 +6,103 @@ import MLXNN
 extension DeepFilterNetModel {
     // MARK: - Feature Helpers
 
+    /// Maximum chunk size for vectorized EMA normalization.
+    /// At 4000 frames, a^4000 ≈ 4e-18 and 1/a^4000 ≈ 2.4e+17, safely within float32 range.
+    /// Beyond ~8800 frames (~90s at 48kHz/hop480), 1/a^t overflows float32 max (3.4e+38).
+    private static let normChunkSize = 4000
+
     func bandMeanNorm(_ x: MLXArray) -> MLXArray {
         let frames = x.shape[0]
         let a = normAlpha()
         let oneMinusA = Float(1.0) - a
-        let time = MLXArray.arange(frames).asType(.float32)
-        let powers = MLX.pow(MLXArray(a), time) // [T]
-        let invPowers = MLXArray(Float(1.0)) / powers
-
-        let scaled = x * invPowers.expandedDimensions(axis: 1)
-        let accum = cumsum(scaled, axis: 0)
-
         let initState = MLXArray(Self.linspace(start: -60.0, end: -90.0, count: x.shape[1]))
-            .expandedDimensions(axis: 0)
-        let state = powers.expandedDimensions(axis: 1) * (initState + MLXArray(oneMinusA) * accum)
-        return (x - state) / MLXArray(Float(40.0))
+
+        if frames <= Self.normChunkSize {
+            let time = MLXArray.arange(frames).asType(.float32)
+            let powers = MLX.pow(MLXArray(a), time)
+            let invPowers = MLXArray(Float(1.0)) / powers
+            let scaled = x * invPowers.expandedDimensions(axis: 1)
+            let accum = cumsum(scaled, axis: 0)
+            let state = powers.expandedDimensions(axis: 1) * (initState.expandedDimensions(axis: 0) + MLXArray(oneMinusA) * accum)
+            return (x - state) / MLXArray(Float(40.0))
+        }
+
+        // Chunked processing to avoid float32 overflow in powers/invPowers
+        var results = [MLXArray]()
+        var prevState = initState  // [bands]
+        let aMLX = MLXArray(a)
+        let oneMinusAMLX = MLXArray(oneMinusA)
+        let scale = MLXArray(Float(40.0))
+
+        for start in stride(from: 0, to: frames, by: Self.normChunkSize) {
+            let end = min(start + Self.normChunkSize, frames)
+            let len = end - start
+            let chunk = x[start..<end, 0...]
+
+            let time = MLXArray.arange(len).asType(.float32)
+            let powers = MLX.pow(aMLX, time)
+            let invPowers = MLXArray(Float(1.0)) / powers
+
+            let scaled = chunk * invPowers.expandedDimensions(axis: 1)
+            let accum = cumsum(scaled, axis: 0)
+
+            let state = powers.expandedDimensions(axis: 1) * (prevState.expandedDimensions(axis: 0) + oneMinusAMLX * accum)
+            results.append((chunk - state) / scale)
+
+            prevState = state[len - 1]
+        }
+
+        return MLX.concatenated(results, axis: 0)
     }
 
     func bandUnitNorm(real: MLXArray, imag: MLXArray) -> (MLXArray, MLXArray) {
         let frames = real.shape[0]
         let a = normAlpha()
         let oneMinusA = Float(1.0) - a
-        let time = MLXArray.arange(frames).asType(.float32)
-        let powers = MLX.pow(MLXArray(a), time) // [T]
-        let invPowers = MLXArray(Float(1.0)) / powers
-
-        let mag = MLX.sqrt(real.square() + imag.square())
-        let scaled = mag * invPowers.expandedDimensions(axis: 1)
-        let accum = cumsum(scaled, axis: 0)
-
         let initState = MLXArray(Self.linspace(start: 0.001, end: 0.0001, count: real.shape[1]))
-            .expandedDimensions(axis: 0)
-        let state = powers.expandedDimensions(axis: 1) * (initState + MLXArray(oneMinusA) * accum)
-        let denom = MLX.sqrt(MLX.maximum(state, MLXArray(Float(1e-12))))
-        return (real / denom, imag / denom)
+        let mag = MLX.sqrt(real.square() + imag.square())
+
+        if frames <= Self.normChunkSize {
+            let time = MLXArray.arange(frames).asType(.float32)
+            let powers = MLX.pow(MLXArray(a), time)
+            let invPowers = MLXArray(Float(1.0)) / powers
+            let scaled = mag * invPowers.expandedDimensions(axis: 1)
+            let accum = cumsum(scaled, axis: 0)
+            let state = powers.expandedDimensions(axis: 1) * (initState.expandedDimensions(axis: 0) + MLXArray(oneMinusA) * accum)
+            let denom = MLX.sqrt(MLX.maximum(state, MLXArray(Float(1e-12))))
+            return (real / denom, imag / denom)
+        }
+
+        // Chunked processing to avoid float32 overflow in powers/invPowers
+        var realResults = [MLXArray]()
+        var imagResults = [MLXArray]()
+        var prevState = initState  // [freqs]
+        let aMLX = MLXArray(a)
+        let oneMinusAMLX = MLXArray(oneMinusA)
+        let eps = MLXArray(Float(1e-12))
+
+        for start in stride(from: 0, to: frames, by: Self.normChunkSize) {
+            let end = min(start + Self.normChunkSize, frames)
+            let len = end - start
+            let chunkMag = mag[start..<end, 0...]
+
+            let time = MLXArray.arange(len).asType(.float32)
+            let powers = MLX.pow(aMLX, time)
+            let invPowers = MLXArray(Float(1.0)) / powers
+
+            let scaled = chunkMag * invPowers.expandedDimensions(axis: 1)
+            let accum = cumsum(scaled, axis: 0)
+
+            let state = powers.expandedDimensions(axis: 1) * (prevState.expandedDimensions(axis: 0) + oneMinusAMLX * accum)
+            let denom = MLX.sqrt(MLX.maximum(state, eps))
+
+            realResults.append(real[start..<end, 0...] / denom)
+            imagResults.append(imag[start..<end, 0...] / denom)
+
+            prevState = state[len - 1]
+        }
+
+        return (MLX.concatenated(realResults, axis: 0), MLX.concatenated(imagResults, axis: 0))
     }
 
     // Exact sequential EMA path (libDF-style), primarily for DF1 parity.

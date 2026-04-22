@@ -153,41 +153,44 @@ public final class CoreMLStreamingEngine: StreamingEngine {
         print("  [CoreML] Will use passthrough (no enhancement) for benchmarking.")
     }
 
+    // THOMAS EDITED CODE HERE 
     private func getCacheDirectory() -> URL {
-        // Check several locations in priority order:
-        // 1. HuggingFace cache (standard location)
-        let hfCache = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".cache")
+        let fm = FileManager.default
+
+        // 1. App's own Caches directory (iOS-safe)
+        let appCaches = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+
+        // Check HuggingFace-style subfolder inside app caches
+        let hfCache = appCaches
             .appendingPathComponent("huggingface")
             .appendingPathComponent("hub")
             .appendingPathComponent("models--aufklarer--DeepFilterNet3-CoreML")
             .appendingPathComponent("snapshots")
 
-        if let snapshots = try? FileManager.default.contentsOfDirectory(
+        if let snapshots = try? fm.contentsOfDirectory(
             at: hfCache, includingPropertiesForKeys: nil
         ), let first = snapshots.first {
             return first
         }
 
-        // 2. Custom cache directory
-        let customCache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        // 2. Custom cache directory inside app caches
+        let customCache = appCaches
             .appendingPathComponent("DeepFilterNet3-CoreML")
 
-        if FileManager.default.fileExists(atPath: customCache.path) {
+        if fm.fileExists(atPath: customCache.path) {
             return customCache
         }
 
-        // 3. ~/.cache/deepfilternet/DeepFilterNet3-CoreML/
-        let deepfilterCache = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".cache")
+        // 3. DeepFilterNet subfolder inside app caches
+        let deepfilterCache = appCaches
             .appendingPathComponent("deepfilternet")
             .appendingPathComponent("DeepFilterNet3-CoreML")
 
-        if FileManager.default.fileExists(atPath: deepfilterCache.path) {
+        if fm.fileExists(atPath: deepfilterCache.path) {
             return deepfilterCache
         }
 
-        // Return the custom cache path (will be created on download)
+        // Fallback: return custom cache path (created on demand)
         return customCache
     }
 
